@@ -17,6 +17,7 @@ import { optimizeResearchTopic } from "@/lib/optimize-research-topic"
 import { normalizePath } from "@/lib/path-utils"
 import { applyGraphFilters, DEFAULT_GRAPH_FILTERS, hasActiveGraphFilters, type GraphFilterState } from "@/lib/graph-filters"
 import { applyGraphSearch } from "@/lib/graph-search"
+import { wikiTypeLabel } from "@/lib/wiki-page-types"
 import { useTranslation } from "react-i18next"
 
 const NODE_TYPE_COLORS: Record<string, string> = {
@@ -32,6 +33,17 @@ const NODE_TYPE_COLORS: Record<string, string> = {
   methodology: "#14b8a6", // teal-500
   other: "#94a3b8",     // slate-400
 }
+
+const CUSTOM_NODE_COLORS = [
+  "#38bdf8",
+  "#34d399",
+  "#fbbf24",
+  "#fb7185",
+  "#a78bfa",
+  "#22d3ee",
+  "#f97316",
+  "#84cc16",
+]
 
 const COMMUNITY_COLORS = [
   "#60a5fa",  // blue-400
@@ -52,9 +64,15 @@ type ColorMode = "type" | "community"
 
 const BASE_NODE_SIZE = 8
 const MAX_NODE_SIZE = 28
+const DEFAULT_NODE_SCALE = 1
+const DEFAULT_GRAPH_SPACING = 1
+const GRAPH_SPACING_DEBOUNCE_MS = 180
 
 function nodeColor(type: string): string {
-  return NODE_TYPE_COLORS[type] ?? NODE_TYPE_COLORS.other
+  if (NODE_TYPE_COLORS[type]) return NODE_TYPE_COLORS[type]
+  let hash = 0
+  for (const char of type) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  return CUSTOM_NODE_COLORS[hash % CUSTOM_NODE_COLORS.length] ?? NODE_TYPE_COLORS.other
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -74,10 +92,16 @@ function mixColor(color1: string, color2: string, ratio: number): string {
   return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`
 }
 
-function nodeSize(linkCount: number, maxLinks: number): number {
+function graphDensityScale(nodeCount: number): number {
+  if (nodeCount <= 150) return 1
+  return Math.max(0.35, Math.sqrt(150 / nodeCount))
+}
+
+function nodeSize(linkCount: number, maxLinks: number, nodeCount: number, userScale: number): number {
   if (maxLinks === 0) return BASE_NODE_SIZE
   const ratio = linkCount / maxLinks
-  return BASE_NODE_SIZE + Math.sqrt(ratio) * (MAX_NODE_SIZE - BASE_NODE_SIZE)
+  const size = BASE_NODE_SIZE + Math.sqrt(ratio) * (MAX_NODE_SIZE - BASE_NODE_SIZE)
+  return size * graphDensityScale(nodeCount) * userScale
 }
 
 // --- Inner components ---
@@ -86,11 +110,23 @@ function nodeSize(linkCount: number, maxLinks: number): number {
 const positionCache = new Map<string, { x: number; y: number }>()
 let lastLayoutDataKey = ""
 
-function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: GraphEdge[]; colorMode: ColorMode }) {
+function GraphLoader({
+  nodes,
+  edges,
+  colorMode,
+  nodeScale,
+  graphSpacing,
+}: {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  colorMode: ColorMode
+  nodeScale: number
+  graphSpacing: number
+}) {
   const loadGraph = useLoadGraph()
 
   useEffect(() => {
-    const dataKey = nodes.map((n) => n.id).sort().join(",") + "|" + edges.length
+    const dataKey = nodes.map((n) => n.id).sort().join(",") + "|" + edges.length + `|spacing:${graphSpacing.toFixed(2)}`
     const needsLayout = dataKey !== lastLayoutDataKey
 
     const graph = new Graph()
@@ -104,7 +140,7 @@ function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: G
       graph.addNode(node.id, {
         x: cached?.x ?? Math.random() * 100,
         y: cached?.y ?? Math.random() * 100,
-        size: nodeSize(node.linkCount, maxLinks),
+        size: nodeSize(node.linkCount, maxLinks, nodes.length, nodeScale),
         color,
         label: node.label,
         nodeType: node.type,
@@ -142,7 +178,7 @@ function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: G
         settings: {
           ...settings,
           gravity: 1,
-          scalingRatio: 2,
+          scalingRatio: graphSpacing * (nodes.length > 400 ? 3 : 2),
           strongGravityMode: true,
           barnesHutOptimize: nodes.length > 50,
         },
@@ -156,7 +192,7 @@ function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: G
     }
 
     loadGraph(graph)
-  }, [loadGraph, nodes, edges, colorMode])
+  }, [loadGraph, nodes, edges, colorMode, nodeScale, graphSpacing])
 
   return null
 }
@@ -339,6 +375,9 @@ export function GraphView() {
   const [showFilters, setShowFilters] = useState(false)
   const [graphSearchOpen, setGraphSearchOpen] = useState(false)
   const [graphSearch, setGraphSearch] = useState("")
+  const [nodeScale, setNodeScale] = useState(DEFAULT_NODE_SCALE)
+  const [graphSpacingDraft, setGraphSpacingDraft] = useState(DEFAULT_GRAPH_SPACING)
+  const [graphSpacing, setGraphSpacing] = useState(DEFAULT_GRAPH_SPACING)
   const [filters, setFilters] = useState<GraphFilterState>(() => ({
     ...DEFAULT_GRAPH_FILTERS,
     hiddenTypes: new Set(),
@@ -346,6 +385,7 @@ export function GraphView() {
   }))
   const [nodeMenu, setNodeMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null)
   const graphContainerRef = useRef<HTMLDivElement>(null)
+  const researchDialogTokenRef = useRef(0)
   // i18n node type labels (populated after mount to support language switching)
   const [nodeTypeLabels, setNodeTypeLabels] = useState<Record<string, string>>({})
   const graphSearchInputRef = useRef<HTMLInputElement>(null)
@@ -355,6 +395,7 @@ export function GraphView() {
     loading: boolean
     topic: string
     queries: string[]
+    dismissKey?: string
   } | null>(null)
   const lastLoadedVersion = useRef(-1)
 
@@ -394,6 +435,13 @@ export function GraphView() {
       other: t("graph.nodeTypeLabels.other"),
     })
   }, [t])
+
+  // Spacing changes trigger ForceAtlas2 layout through GraphLoader's dataKey.
+  // Keep the slider responsive while debouncing the expensive relayout.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setGraphSpacing(graphSpacingDraft), GRAPH_SPACING_DEBOUNCE_MS)
+    return () => window.clearTimeout(timer)
+  }, [graphSpacingDraft])
 
   useEffect(() => {
     if (dataVersion !== lastLoadedVersion.current) {
@@ -441,16 +489,37 @@ export function GraphView() {
       hiddenTypes: new Set(),
       hiddenNodeIds: new Set(),
     })
+    setNodeScale(DEFAULT_NODE_SCALE)
+    setGraphSpacingDraft(DEFAULT_GRAPH_SPACING)
+    setGraphSpacing(DEFAULT_GRAPH_SPACING)
     setNodeMenu(null)
   }, [])
 
-  const handleResearchClick = useCallback(async (gapTitle: string, gapDescription: string, gapType: string) => {
+  const knowledgeGapKey = useCallback((gap: KnowledgeGap) => (
+    `gap:${gap.type}:${gap.title}:${gap.nodeIds.join(",")}`
+  ), [])
+
+  const visibleKnowledgeGaps = useMemo(
+    () => knowledgeGaps.filter((gap) => !dismissedInsights.has(knowledgeGapKey(gap))),
+    [dismissedInsights, knowledgeGaps, knowledgeGapKey],
+  )
+
+  const dismissInsight = useCallback((key: string, ids?: Set<string>) => {
+    setDismissedInsights((prev) => new Set([...prev, key]))
+    if (ids && highlightedNodes.size === ids.size && [...ids].every((id) => highlightedNodes.has(id))) {
+      setHighlightedNodes(new Set())
+    }
+  }, [highlightedNodes])
+
+  const handleResearchClick = useCallback(async (gapTitle: string, gapDescription: string, gapType: string, dismissKey?: string) => {
     const store = useWikiStore.getState()
     if (!store.project) return
     const pp = normalizePath(store.project.path)
+    const token = researchDialogTokenRef.current + 1
+    researchDialogTokenRef.current = token
 
     // Show loading state
-    setResearchDialog({ loading: true, topic: "", queries: [] })
+    setResearchDialog({ loading: true, topic: "", queries: [], dismissKey })
 
     try {
       // Read overview and purpose for context
@@ -467,10 +536,12 @@ export function GraphView() {
         overview,
         purpose,
       )
-      setResearchDialog({ loading: false, topic: result.topic, queries: result.searchQueries })
+      if (researchDialogTokenRef.current !== token) return
+      setResearchDialog({ loading: false, topic: result.topic, queries: result.searchQueries, dismissKey })
     } catch {
+      if (researchDialogTokenRef.current !== token) return
       // Fallback: use raw title
-      setResearchDialog({ loading: false, topic: gapTitle, queries: [gapTitle] })
+      setResearchDialog({ loading: false, topic: gapTitle, queries: [gapTitle], dismissKey })
     }
   }, [])
 
@@ -485,6 +556,10 @@ export function GraphView() {
       store.searchApiConfig,
       researchDialog.queries,
     )
+    if (researchDialog.dismissKey) {
+      setDismissedInsights((prev) => new Set([...prev, researchDialog.dismissKey!]))
+      setHighlightedNodes(new Set())
+    }
     setResearchDialog(null)
   }, [researchDialog])
 
@@ -534,6 +609,13 @@ export function GraphView() {
     acc[n.type] = (acc[n.type] ?? 0) + 1
     return acc
   }, {})
+  const nodeTypeLabelMap = useMemo(() => {
+    const labels = { ...nodeTypeLabels }
+    for (const type of Object.keys(typeCounts)) {
+      labels[type] ??= wikiTypeLabel(type)
+    }
+    return labels
+  }, [nodeTypeLabels, typeCounts])
 
   const filteredGraph = useMemo(
     () => applyGraphFilters(nodes, edges, filters),
@@ -690,7 +772,7 @@ export function GraphView() {
             <Layers className="h-3 w-3" />
             {t("graph.community")}
           </Button>
-          {(surprisingConns.filter((c) => !dismissedInsights.has(c.key)).length > 0 || knowledgeGaps.length > 0) && (
+          {(surprisingConns.filter((c) => !dismissedInsights.has(c.key)).length > 0 || visibleKnowledgeGaps.length > 0) && (
             <Button
               variant={showInsights ? "secondary" : "ghost"}
               size="sm"
@@ -705,7 +787,7 @@ export function GraphView() {
               <Lightbulb className="h-3 w-3" />
               {t("graph.insights")}
               <span className="rounded bg-muted px-1 text-[10px]">
-                {surprisingConns.filter((c) => !dismissedInsights.has(c.key)).length + knowledgeGaps.length}
+                {surprisingConns.filter((c) => !dismissedInsights.has(c.key)).length + visibleKnowledgeGaps.length}
               </span>
             </Button>
           )}
@@ -789,7 +871,13 @@ export function GraphView() {
               },
             }}
           >
-            <GraphLoader nodes={searchedGraph.nodes} edges={searchedGraph.edges} colorMode={colorMode} />
+            <GraphLoader
+              nodes={searchedGraph.nodes}
+              edges={searchedGraph.edges}
+              colorMode={colorMode}
+              nodeScale={nodeScale}
+              graphSpacing={graphSpacing}
+            />
             <EventHandler onNodeClick={handleNodeClick} onNodeContextMenu={handleNodeContextMenu} />
             <HighlightManager highlightedNodes={searchActive ? searchedGraph.matchedNodeIds : highlightedNodes} />
             <ZoomControls />
@@ -857,10 +945,47 @@ export function GraphView() {
                   </div>
                 </div>
 
+                <div className="space-y-2">
+                  <div className="font-medium text-muted-foreground">{t("graph.displayTuning")}</div>
+                  <label className="block space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span>{t("graph.nodeSize")}</span>
+                      <span className="text-muted-foreground">{Math.round(nodeScale * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1.5}
+                      step={0.05}
+                      value={nodeScale}
+                      onChange={(e) => setNodeScale(Number(e.target.value))}
+                      className="w-full"
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span>{t("graph.spacing")}</span>
+                      <span className="text-muted-foreground">{Math.round(graphSpacingDraft * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.6}
+                      max={2.2}
+                      step={0.05}
+                      value={graphSpacingDraft}
+                      onChange={(e) => setGraphSpacingDraft(Number(e.target.value))}
+                      className="w-full"
+                    />
+                  </label>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    {t("graph.displayTuningHint")}
+                  </p>
+                </div>
+
                 <div className="space-y-1.5">
                   <div className="font-medium text-muted-foreground">{t("graph.nodeTypes")}</div>
                   <div className="grid grid-cols-2 gap-1">
-                    {Object.entries(nodeTypeLabels)
+                    {Object.entries(nodeTypeLabelMap)
                       .filter(([type]) => (typeCounts[type] ?? 0) > 0)
                       .map(([type, label]) => (
                         <label key={type} className="flex min-w-0 items-center gap-1.5">
@@ -977,7 +1102,7 @@ export function GraphView() {
               colorMode === "type" ? (
                 <div className="flex flex-col gap-0.5 max-h-48 overflow-y-auto legend-scroll" style={{ direction: "rtl" }}>
                   <div className="flex flex-col gap-0.5" style={{ direction: "ltr" }}>
-                    {Object.entries(nodeTypeLabels)
+                    {Object.entries(nodeTypeLabelMap)
                       .filter(([type]) => (typeCounts[type] ?? 0) > 0)
                       .map(([type, label]) => {
                         const isHidden = filters.hiddenTypes.has(type)
@@ -1003,8 +1128,8 @@ export function GraphView() {
                             <span
                               className="inline-block h-3 w-3 rounded-full shrink-0 shadow-sm"
                               style={{
-                                backgroundColor: isHidden ? "#94a3b8" : NODE_TYPE_COLORS[type],
-                                boxShadow: `0 0 4px ${hexToRgba(isHidden ? "#94a3b8" : NODE_TYPE_COLORS[type] ?? "#94a3b8", 0.4)}`,
+                                backgroundColor: isHidden ? "#94a3b8" : nodeColor(type),
+                                boxShadow: `0 0 4px ${hexToRgba(isHidden ? "#94a3b8" : nodeColor(type), 0.4)}`,
                               }}
                             />
                             <span className={hoveredType === type ? "text-foreground font-medium" : "text-muted-foreground"}>
@@ -1098,8 +1223,7 @@ export function GraphView() {
                                 className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
                                 onClick={(e) => {
                                   e.stopPropagation()
-                                  setDismissedInsights((prev) => new Set([...prev, conn.key]))
-                                  if (isActive) setHighlightedNodes(new Set())
+                                  dismissInsight(conn.key, ids)
                                 }}
                               >
                                 <X className="h-3.5 w-3.5" />
@@ -1116,14 +1240,15 @@ export function GraphView() {
               )}
 
               {/* Knowledge Gaps */}
-              {knowledgeGaps.length > 0 && (
+              {visibleKnowledgeGaps.length > 0 && (
                 <div>
                   <div className="flex items-center gap-1.5 mb-2 text-xs font-semibold text-foreground">
                     <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
                     {t("graph.knowledgeGaps")}
                   </div>
                   <div className="flex flex-col gap-2">
-                    {knowledgeGaps.map((gap, i) => {
+                    {visibleKnowledgeGaps.map((gap, i) => {
+                      const gapKey = knowledgeGapKey(gap)
                       const ids = new Set(gap.nodeIds)
                       const isActive = highlightedNodes.size > 0 &&
                         [...ids].every((id) => highlightedNodes.has(id)) &&
@@ -1134,7 +1259,19 @@ export function GraphView() {
                           className={`rounded-lg border p-3 text-sm cursor-pointer transition-colors ${isActive ? "bg-amber-500/10 border-amber-500/40" : "hover:bg-muted/50"}`}
                           onClick={() => setHighlightedNodes(isActive ? new Set() : ids)}
                         >
-                          <div className="font-medium text-xs text-foreground mb-1">{gap.title}</div>
+                          <div className="flex items-start justify-between gap-2 mb-1">
+                            <div className="font-medium text-xs text-foreground">{gap.title}</div>
+                            <button
+                              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
+                              title={t("common.dismiss")}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                dismissInsight(gapKey, ids)
+                              }}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                           <p className="text-xs text-muted-foreground mb-2">{gap.description}</p>
                           <p className="text-xs text-muted-foreground/80 italic mb-2">{gap.suggestion}</p>
                           <Button
@@ -1143,7 +1280,7 @@ export function GraphView() {
                             className="h-7 text-xs gap-1"
                             onClick={(e) => {
                               e.stopPropagation()
-                              handleResearchClick(gap.title, gap.description, gap.type)
+                              handleResearchClick(gap.title, gap.description, gap.type, gapKey)
                             }}
                           >
                             <Search className="h-3.5 w-3.5" />
@@ -1169,14 +1306,15 @@ export function GraphView() {
                 <Search className="h-4 w-4 text-primary" />
                 <span className="font-medium text-sm">{t("graph.deepResearch")}</span>
               </div>
-              {!researchDialog.loading && (
-                <button
-                  className="p-1 rounded hover:bg-muted text-muted-foreground"
-                  onClick={() => setResearchDialog(null)}
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              )}
+              <button
+                className="p-1 rounded hover:bg-muted text-muted-foreground"
+                onClick={() => {
+                  researchDialogTokenRef.current += 1
+                  setResearchDialog(null)
+                }}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
 
             {researchDialog.loading ? (
@@ -1221,7 +1359,14 @@ export function GraphView() {
                   </div>
                 </div>
                 <div className="flex justify-end gap-2">
-                  <Button variant="outline" size="sm" onClick={() => setResearchDialog(null)}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      researchDialogTokenRef.current += 1
+                      setResearchDialog(null)
+                    }}
+                  >
                     {t("graph.cancel")}
                   </Button>
                   <Button
